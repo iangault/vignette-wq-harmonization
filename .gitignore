@@ -1,0 +1,26 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Rendered output (regenerate from source)
+*.html
+*.pdf
+*.docx
+
+# Data (raw data stays local — use data/synthetic for committed examples)
+data/raw/
+
+# Package/renv
+renv/library/
+renv/local/
+renv/lock/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs (regenerate from analysis)
+outputs/figures/*.png
+outputs/figures/*.pdf

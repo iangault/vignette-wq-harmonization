@@ -1,0 +1,510 @@
+---
+title: "Water Quality Data Harmonization"
+subtitle: "Standardizing Multi-Lab Environmental Monitoring Data"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  echo    = TRUE,
+  fig.width = 9,
+  fig.height = 5
+)
+# Set working directory to project root so all paths resolve from there.
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(knitr)
+library(DT)
+library(lubridate)
+library(table.glue)
+```
+
+```{r source-functions}
+source("R/utils.R")
+source("R/harmonize.R")
+source("R/units.R")
+source("R/qaqc.R")
+source("R/database.R")
+```
+
+```{r generate-data, include=FALSE}
+# Generate synthetic data if not already present.
+if (!file.exists("data/raw/wq_raw.csv") || !file.exists("data/raw/wq_insitu.csv")) {
+  source("R/generate_synthetic_data.R")
+}
+```
+
+---
+
+## Background
+
+Environmental monitoring programs typically submit water quality samples to one or more external laboratories under distinct submission codes. Each code corresponds to a method bundle — for example, a freshwater nutrient panel (E100), an ion chromatography panel (E235), or a seawater metals package (E469S). The same compound can have a different name under each code: what E100 calls *"Ammonia, total (as N)"* is the same thing E235 calls *"Nitrogen - Ammonia as N"*.
+
+When results from multiple programs and submission codes are combined into a single dataset, these naming differences produce artificial duplicates, break group-level summaries, and prevent correct joins to reference tables. This vignette walks through a production pipeline for resolving those inconsistencies and producing a clean, analysis-ready dataset.
+
+The pipeline covers:
+
+1. Analyte name harmonization across lab naming conventions
+2. Dissolved/total fraction parsing
+3. Analysis group classification (Conventional, Nutrients, Metals, etc.)
+4. Freshwater vs. seawater classification by specific conductance
+5. Detection limit flagging and half-DL substitution
+6. Unit standardization (µg/L → mg/L or ng/L)
+7. QAQC: blank screening, field duplicate RPD, holding-time exceedances, dissolved:total ratio check
+8. Field in situ data joined as wide cofactors (sp.cond drives water type; pH, DO, temperature retained for guideline calculations)
+
+---
+
+## 1. Data
+
+```{r load-data}
+wq_dat <- read_csv("data/raw/wq_raw.csv",
+                   col_types = cols(
+                     sample.date = col_date(),
+                     result      = col_character(),  # may contain "<" prefix
+                     hold.time   = col_character(),  # "T"/"F" must not be parsed as logical
+                     dl          = col_double()
+                   ))
+
+insitu <- read_csv("data/raw/wq_insitu.csv",
+                   col_types = cols(sample.date = col_date()))
+```
+
+In-situ field measurements (specific conductance, pH, DO, temperature, etc.) are recorded once per site visit and stored in a separate file. They must be joined onto the lab rows **before water type classification** (section 5), because `water.type` is determined from field specific conductance — not from the lab submission code.
+
+```{r join-insitu-early}
+# Left-join in-situ data so sp.cond.uS.cm is available for water type
+# classification. Blank sites and duplicates receive NAs (no instrument reading),
+# which is handled by the -FB/-TB guard in assign_water_type().
+wq_dat <- left_join(wq_dat, insitu,
+                    by = c("site.impute" = "site", "sample.date" = "sample.date"))
+
+str(wq_dat)
+```
+
+```{r data-summary, echo=FALSE}
+tibble(
+  Metric = c("Total rows", "Programs", "Sites", "Sampling dates",
+             "Unique raw analyte names"),
+  Value  = c(
+    nrow(wq_dat),
+    n_distinct(wq_dat$program),
+    n_distinct(wq_dat$site),
+    n_distinct(wq_dat$sample.date),
+    n_distinct(wq_dat$analyte)
+  )
+) %>%
+  datatable(caption = "Raw dataset overview", rownames = FALSE,
+            options = list(pageLength = 10, dom = "t"))
+```
+
+The problem is visible immediately: different programs submit the same compounds under different analyte names.
+
+```{r naming-conflict-demo, echo=FALSE}
+wq_dat %>%
+  filter(grepl("mmonia|itrate", analyte)) %>%
+  distinct(program, analyte, test.code) %>%
+  arrange(analyte) %>%
+  datatable(
+    caption  = "The same N-species appear under different names depending on the lab submission code",
+    rownames = FALSE,
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+---
+
+## 2. Analyte Name Harmonization
+
+Each raw analyte name is mapped to a canonical name via a lookup table defined in `R/functions/harmonize.R`. The lookup covers common variants observed across standard lab submission codes; names not in the table pass through unchanged.
+
+```{r harmonize-names}
+wq_dat <- harmonize_analyte_names(wq_dat)
+```
+
+```{r harmonize-names-check, echo=FALSE}
+wq_dat %>%
+  filter(grepl("mmonia|itrate", analyte)) %>%
+  distinct(program, analyte, analyte.impute, test.code) %>%
+  arrange(analyte.impute) %>%
+  datatable(
+    caption  = "After harmonization, both programs share the same canonical name",
+    rownames = FALSE,
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+The full set of harmonized analyte names:
+
+```{r all-analytes, echo=FALSE}
+tibble(Analyte = sort(unique(wq_dat$analyte.impute))) %>%
+  datatable(caption = "All harmonized analyte names", rownames = FALSE,
+            options = list(pageLength = 10))
+```
+
+---
+
+## 3. Dissolved / Total Fraction Parsing
+
+Metals reported as dissolved or total fractions carry that information as a suffix in the analyte name (e.g. *"Copper, total"*). The suffix is not part of the analyte identity — it describes the sample preparation — so it is parsed into a separate `analysis` column and stripped from the name.
+
+```{r strip-fractions}
+wq_dat <- strip_fraction_suffix(wq_dat)
+```
+
+```{r fractions-check, echo=FALSE}
+wq_dat %>%
+  filter(!is.na(analysis)) %>%
+  distinct(analyte.impute, analysis) %>%
+  arrange(analysis, analyte.impute) %>%
+  datatable(
+    caption  = "Fraction suffix parsed into analysis column",
+    rownames = FALSE,
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+---
+
+## 4. Analysis Group Classification
+
+Analytes are assigned to reporting groups that determine which regulatory guidelines apply and how results are presented in the report. The groups are:
+
+| Group | Examples |
+|---|---|
+| Conventional Parameters | pH, TSS, DOC, hardness |
+| Nutrients and Biological Indicators | ammonia, nitrate, chlorophyll |
+| Major Ions | sodium, calcium, chloride |
+| Total Metals | copper total, lead total |
+| Dissolved Metals | copper dissolved, lead dissolved |
+
+```{r classify-groups}
+# Phosphorus from nutrient test codes (lower DL, nutrient panel) is mapped to
+# "Total Phosphorus" in Nutrients rather than the metals-panel "Phosphorus".
+# Adjust these codes to match your lab's submission structure.
+phosphorus_nutrient_codes <- c("E372-U", "E372S")
+
+wq_dat <- classify_analysis_group(wq_dat, phosphorus_nutrient_codes)
+```
+
+```{r groups-check, echo=FALSE}
+wq_dat %>%
+  count(analysis) %>%
+  arrange(analysis) %>%
+  datatable(caption = "Row counts by analysis group after classification",
+            rownames = FALSE,
+            options  = list(pageLength = 10, dom = "t"))
+```
+
+---
+
+## 5. Water Type Classification
+
+Freshwater and seawater samples require different analytical methods (different digestion matrices and detection limits). Classification uses specific conductance when available, with the lab submission code as a cross-check. Blank sites are always classified as freshwater regardless of conductance.
+
+```{r water-type}
+wq_dat <- assign_water_type(wq_dat)
+```
+
+```{r water-type-check, echo=FALSE}
+wq_dat %>%
+  distinct(site.impute, sub.matrix, water.type, actual.test) %>%
+  arrange(site.impute) %>%
+  datatable(caption = "Water type and test classification by site",
+            rownames = FALSE,
+            options  = list(pageLength = 10, scrollX = TRUE))
+```
+
+---
+
+## 6. Detection Limit Handling
+
+Lab results below the detection limit are reported as character strings prefixed with `<` (e.g. `"<0.001"`). Before any arithmetic these must be:
+
+1. Flagged with a logical `dl.f` column so censored values can be excluded from parametric statistics.
+2. Substituted with **½ DL** as a conventional placeholder for calculations where censored results cannot simply be dropped.
+
+```{r flag-dl}
+wq_dat <- flag_below_dl(wq_dat)
+```
+
+```{r dl-summary, echo=FALSE}
+wq_dat %>%
+  group_by(analysis) %>%
+  summarise(
+    `Total Results`    = n(),
+    `Below DL`         = sum(dl.f, na.rm = TRUE),
+    `% Below DL`       = round(mean(dl.f, na.rm = TRUE) * 100, 1)
+  ) %>%
+  arrange(analysis) %>%
+  datatable(caption = "Proportion of results below detection limit by analysis group",
+            rownames = FALSE,
+            options  = list(pageLength = 10, dom = "t"))
+```
+
+---
+
+## 7. Unit Standardization
+
+Labs report metals in µg/L and nutrients in mg/L. For consistent cross-analyte presentation all results are converted to a common unit per analyte class. Mercury is converted from µg/L to ng/L because its detection threshold is at sub-nanogram concentrations.
+
+Detection limits are scaled by the same conversion factor as results.
+
+```{r standardize-units}
+wq_dat <- standardize_units(wq_dat)
+```
+
+```{r units-check, echo=FALSE}
+wq_dat %>%
+  filter(grepl("Copper|Mercury|Ammonia|TSS", analyte.impute)) %>%
+  distinct(analyte.impute, analysis, unit, unit.impute) %>%
+  arrange(analysis, analyte.impute) %>%
+  datatable(caption = "Original vs. standardized units for selected analytes",
+            rownames = FALSE,
+            options  = list(pageLength = 10, scrollX = TRUE))
+```
+
+---
+
+## 8. QAQC
+
+### 8a. Sample hash
+
+A `sample.hash` uniquely identifies each station–date combination and is used in all subsequent QAQC joining operations.
+
+```{r sample-hash}
+wq_dat <- wq_dat %>%
+  mutate(sample.hash = paste(site.impute, sample.date, sep = "|"))
+```
+
+---
+
+### 8b. Analytical Deduplication
+
+When the same analyte appears twice for the same sample (submitted under two test codes, or to two labs), the row with the lower detection limit is retained — the finer threshold is more informative.
+
+```{r dedup}
+dedup_group_vars <- c(
+  "site.impute", "sample.date", "sample.id", "water.type", "sample.type",
+  "actual.test", "test.code", "duplicate", "analysis", "analyte.impute", "unit.impute"
+)
+
+n_before <- nrow(wq_dat)
+wq_dat   <- deduplicate_wq(wq_dat, dedup_group_vars)
+n_after  <- nrow(wq_dat)
+
+cat(sprintf("Removed %d duplicate rows (%d → %d)\n", n_before - n_after, n_before, n_after))
+```
+
+---
+
+### 8c. Blank Screening
+
+Field and travel blanks should return results below detection. A detection exceeding 5× DL indicates probable contamination during sampling (field blank) or transport (travel blank) and warrants investigation before the paired environmental samples are used.
+
+```{r blank-screening}
+blank_results <- screen_blanks(wq_dat)
+```
+
+```{r blank-table, echo=FALSE}
+blank_results %>%
+  select(sample.type, site.impute, sample.date, analysis, analyte.impute,
+         result.impute, dl.impute, unit.impute, exceeds_5x_dl) %>%
+  filter(!is.na(result.impute)) %>%
+  mutate(exceeds_5x_dl = if_else(exceeds_5x_dl, "YES", "")) %>%
+  arrange(sample.type, analysis, analyte.impute) %>%
+  datatable(
+    caption  = "Blank results. Detections > 5× DL flagged.",
+    rownames = FALSE,
+    options  = list(pageLength = 10, scrollX = TRUE)
+  ) %>%
+  formatStyle("exceeds_5x_dl", backgroundColor = styleEqual("YES", "#fff3cd"))
+```
+
+---
+
+### 8d. Field Duplicate RPD
+
+Field duplicates are collected by re-sampling the same location immediately after the primary sample. RPD (relative percent difference) quantifies analytical and sampling precision.
+
+- RPD = `2 |A - B| / (A + B) × 100`
+- Pairs where both results are below DL → reported as **\<DL**
+- Pairs where either result is below 5× DL → **NC** (not calculable; precision cannot be assessed near the detection threshold)
+
+```{r rpd}
+rpd_table <- compute_rpd(wq_dat)
+```
+
+```{r rpd-table, echo=FALSE}
+rpd_table %>%
+  datatable(caption = "RPD for field duplicate pairs",
+            rownames = FALSE,
+            options  = list(pageLength = 10, scrollX = TRUE))
+```
+
+---
+
+### 8e. Holding-Time Exceedances
+
+Some analytes degrade rapidly after collection. Results from samples that exceeded the maximum allowable holding time are flagged; they may still be usable depending on the degree of exceedance and the analyte's known degradation rate.
+
+```{r holding-times}
+wq_dat       <- parse_holding_time(wq_dat)
+hold_summary <- holding_time_summary(wq_dat)
+```
+
+```{r hold-table, echo=FALSE}
+if (nrow(hold_summary) > 0) {
+  hold_summary %>%
+    datatable(caption = "Holding-time exceedances by program and analyte",
+              rownames = FALSE,
+              options  = list(pageLength = 10, scrollX = TRUE))
+} else {
+  cat("No holding-time exceedances in this dataset.")
+}
+```
+
+---
+
+### 8f. Dissolved : Total Metals Ratio
+
+Dissolved metal concentration cannot substantially exceed total metal concentration: dissolved is a sub-fraction of total. A ratio > 1.5 is a red flag for a labelling error, a sample swap, or an analytical matrix effect.
+
+```{r dt-ratio}
+dt_flags <- check_dt_ratio(wq_dat)
+```
+
+```{r dt-table, echo=FALSE}
+if (nrow(dt_flags) > 0) {
+  dt_flags %>%
+    datatable(caption = "Dissolved:Total ratio flags (ratio > 1.5)",
+              rownames = FALSE,
+              options  = list(pageLength = 10, scrollX = TRUE))
+} else {
+  cat("No dissolved:total ratio exceedances in this dataset.")
+}
+```
+
+---
+
+## 9. Week Labelling
+
+Sampling events are grouped into sequential calendar weeks to support week-by-week comparisons in the report.
+
+```{r week-labels}
+wq_dat <- label_weeks(wq_dat, n_weeks = 5)
+```
+
+---
+
+## 10. Final Dataset
+
+Environmental samples only (blanks and duplicates are presented in the QAQC section). In situ field measurements are retained as wide columns on each lab row — they serve as per-sample cofactors for guideline calculations (e.g. hardness-dependent criteria) and informed the water type classification in section 5. Effluent samples are classified as `"Effluent"` regardless of conductance.
+
+```{r final-select}
+insitu_wide_cols <- c("pH", "sp.cond.uS.cm", "sal.ppt", "temp.C",
+                      "diss.O2.mg.L", "diss.O2.percent", "redox.ORP", "turbidity.NTU")
+
+wq_out <- wq_dat %>%
+  filter(is.na(sample.type)) %>%
+  select(
+    program, sample.id, site.impute,
+    sample.date, sample.time, week,
+    water.type, actual.test,
+    analysis, analyte.impute, test.code,
+    result.impute, unit.impute, dl.impute, dl.f,
+    source, lab.id, hold.time,
+    all_of(insitu_wide_cols),
+    e.coordinate, n.coordinate, depth.m
+  ) %>%
+  mutate(analysis = factor(analysis,
+                           levels = analysis_levels[analysis_levels != "Field Measured"])) %>%
+  arrange(program, site.impute, sample.date, analysis, analyte.impute)
+```
+
+```{r final-summary, echo=FALSE}
+tibble(
+  Metric = c("Total rows", "Programs", "Sites", "Sampling dates",
+             "Harmonized analyte names", "Analysis groups"),
+  Value  = c(
+    nrow(wq_out),
+    n_distinct(wq_out$program),
+    n_distinct(wq_out$site.impute),
+    n_distinct(wq_out$sample.date),
+    n_distinct(wq_out$analyte.impute),
+    n_distinct(wq_out$analysis)
+  )
+) %>%
+  datatable(caption = "Final harmonized dataset", rownames = FALSE,
+            options = list(pageLength = 10, dom = "t"))
+```
+
+```{r final-table, echo=FALSE}
+wq_out %>%
+  mutate(
+    dl.f          = if_else(dl.f, "Y", "", missing = ""),
+    result.impute = round(result.impute, 5),
+    dl.impute     = round(dl.impute, 5)
+  ) %>%
+  rename(
+    Program   = program,
+    Site      = site.impute,
+    Date      = sample.date,
+    Week      = week,
+    `Test`    = actual.test,
+    `Water`   = water.type,
+    Analysis  = analysis,
+    Analyte   = analyte.impute,
+    Result    = result.impute,
+    Unit      = unit.impute,
+    DL        = dl.impute,
+    `<DL`     = dl.f,
+    Source    = source,
+    Lab       = lab.id,
+    `Hold`    = hold.time,
+    `pH`      = pH,
+    `SpCond`  = sp.cond.uS.cm,
+    `Temp.C`  = temp.C,
+    `DO.mg.L` = diss.O2.mg.L
+  ) %>%
+  select(-sample.id, -sample.time, -test.code,
+         -e.coordinate, -n.coordinate, -depth.m,
+         -sal.ppt, -diss.O2.percent, -redox.ORP, -turbidity.NTU) %>%
+  datatable(
+    filter     = "top",
+    rownames   = FALSE,
+    extensions = "Buttons",
+    options    = list(
+      pageLength = 15,
+      scrollX    = TRUE,
+      dom        = "Bfrtip",
+      buttons    = list("csv", "excel")
+    ),
+    caption = "Final harmonized dataset — filter by any column, export with buttons above"
+  ) %>%
+  formatStyle(
+    "<DL",
+    backgroundColor = styleEqual("Y", "#fff3cd")
+  )
+```
+
+```{r save-output}
+saveRDS(wq_out, file = "data/processed/wq_harmonized.RDS")
+```
+
+---
+
+*This vignette uses synthetic data generated by `data/generate_synthetic_data.R`. The pipeline structure reflects work across multiple environmental monitoring programs; all program names, site identifiers, and laboratory references have been replaced with generic labels.*
