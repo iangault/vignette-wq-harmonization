@@ -1,0 +1,41 @@
+name: Render and Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  render-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.2'
+
+      - name: Install dependencies
+        run: |
+          R -e "install.packages(c('devtools', 'rmarkdown', 'knitr'))"
+          R -e "devtools::install_deps(dependencies = TRUE)"
+
+      - name: Render vignettes
+        run: |
+          R -e "devtools::build_vignettes()"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v2
+        with:
+          path: 'doc'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v2
