@@ -322,8 +322,9 @@ wq_raw <- bind_rows(
   ) %>%
   arrange(program, site, sample.date, analyte)
 
-write_csv(wq_raw, "data/wq_raw.csv")
-message(sprintf("Wrote %d rows to data/wq_raw.csv", nrow(wq_raw)))
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+write_csv(wq_raw, "data/raw/wq_raw.csv")
+message(sprintf("Wrote %d rows to data/raw/wq_raw.csv", nrow(wq_raw)))
 
 # ---- In-situ field measurements (one row per site × date) -------------------
 # Saved separately; left-joined to harmonized lab data downstream.
@@ -356,5 +357,5 @@ wq_insitu <- crossing(site_base, sample.date = dates) %>%
   ) %>%
   arrange(site, sample.date)
 
-write_csv(wq_insitu, "data/wq_insitu.csv")
-message(sprintf("Wrote %d rows to data/wq_insitu.csv", nrow(wq_insitu)))
+write_csv(wq_insitu, "data/raw/wq_insitu.csv")
+message(sprintf("Wrote %d rows to data/raw/wq_insitu.csv", nrow(wq_insitu)))
