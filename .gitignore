@@ -12,10 +12,10 @@
 # Data (raw data stays local — use data/synthetic for committed examples)
 data/raw/
 
-# Package/renv
+# Package/renv (library is OS-specific; lockfile and activate.R must be committed)
 renv/library/
 renv/local/
-renv/lock/
+renv/staging/
 
 # OS
 .DS_Store
