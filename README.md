@@ -2,7 +2,7 @@
 
 Multi-lab water quality data arrive with inconsistent analyte names, mixed units, and detection limit notations. This vignette demonstrates a production-grade pipeline for standardizing raw lab exports into a clean, analysis-ready dataset.
 
-The pipeline reflects work across multiple environmental monitoring programs. All program names, site identifiers, and laboratory references have been replaced with generic labels; synthetic data is used so the vignette runs standalone.
+This project uses synthetic data. The workflow reflects practices commonly used across many water quality monitoring programs of this type. Program, site, and laboratory labels are generic.
 
 ## What this covers
 

@@ -75,7 +75,7 @@ metals_base <- tibble::tribble(
   "Zinc",        "µg/L",   1.000,    0.500,     5.0,     80.0,      3.0,     50.0
 )
 
-# Expand to total + dissolved analyte rows (ALS lab, ICPMS method)
+# Expand to total + dissolved analyte rows (commercial lab, ICP-MS method)
 metals_total <- metals_base %>%
   transmute(
     analyte    = paste0(element, ", total"),
@@ -100,7 +100,7 @@ mercury_analytes <- tibble::tribble(
   "Methylmercury (as MeHg), total",  "µg/L",  0.000010,    0.00002,      0.00100,      "METHYL",    "Research Lab"
 )
 
-# Nutrients and conventional parameters (ALS lab)
+# Nutrients and conventional parameters (commercial lab)
 river1_nutrients <- tibble::tribble(
   ~analyte,                                ~test.code, ~lab.id, ~unit,   ~dl,    ~lo,    ~hi,
   "Ammonia, total (as N)",                 "E100",     "Commercial Lab",   "mg/L",  0.010,  0.05,   0.80,

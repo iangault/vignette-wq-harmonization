@@ -24,7 +24,7 @@ flag_below_dl <- function(df) {
 }
 
 # Parse lab holding-time symbols to a consistent "T" (exceeded) / "F" (ok) flag.
-# Historical lab exports use Unicode checkmark/cross glyphs (ü/û), the letters
+# Lab exports commonly use Unicode checkmark/cross glyphs (ü/û), the letters
 # T/F, or logical TRUE/FALSE (introduced when readr guesses column type).
 # Converting to character first ensures case_when always operates on one type.
 parse_holding_time <- function(df) {
